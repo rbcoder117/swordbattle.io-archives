@@ -1,8 +1,15 @@
+/*
+                           _ _           _   _   _        _
+ _____      _____  _ __ __| | |__   __ _| |_| |_| | ___  (_) ___
+/ __\ \ /\ / / _ \| '__/ _` | '_ \ / _` | __| __| |/ _ \ | |/ _ \
+\__ \\ V  V / (_) | | | (_| | |_) | (_| | |_| |_| |  __/_| | (_) |
+|___/ \_/\_/ \___/|_|  \__,_|_.__/ \__,_|\__|\__|_|\___(_)_|\___/
+A game by Gautam
+*/
 const express = require("express");
 const https = require("https");
 var http = require("http");
 require("dotenv").config();
-const { Server } = require("socket.io");
 const app = express();
 var emailValidator = require("email-validator");
 const bcrypt = require("bcrypt");
@@ -12,6 +19,7 @@ var process = require("process");
 
 const Filtery = require("purgomalum-swear-filter");
 const filtery = new Filtery();
+
 
 var usewebhook = false;
 if(process.env.hasOwnProperty("WEBHOOK_URL")) usewebhook = true;
@@ -30,7 +38,7 @@ Hook.success(process.env.SERVER, "Server started");
 }
 var serverState = "running";
 
-var map = 10000;
+var map = 15000;
 //var cors = require("cors");
 
 var server;
@@ -43,31 +51,35 @@ if (process.env.USEFISHYSSL === "true") {
   usinghttps = true;
   var options = {
     key: fs.readFileSync(
-      "/etc/letsencrypt/live/us2.swordbattle.io/privkey.pem"
+      "/etc/letsencrypt/live/www.swordbattle.io/privkey.pem"
     ),
     cert: fs.readFileSync(
-      "/etc/letsencrypt/live/us2.swordbattle.io/fullchain.pem"
+      "/etc/letsencrypt/live/www.swordbattle.io/fullchain.pem"
     ),
   };
   httpsserver = https.createServer(options, app).listen(443);
 }
 server = http.createServer(app);
 
+const ws = require("ws");
+const wss = new ws.Server({ server: usinghttps ? httpsserver : server });
 //server = http.createServer(app);
+
 
 const axios = require("axios").default;
 var filter = require("leo-profanity");
 const moderation = require("./moderation");
 const { v4: uuidv4 } = require("uuid");
-// var {recaptcha} = require("./config.json");
+ var {recaptcha, localServer} = require("./config.json");
 
 // DISABLED DUE TO PEOPLE HAVING ISSUES
 
-recaptcha = true;
+// recaptcha = true;
 
 var passwordValidator = require("password-validator");
 var schema = new passwordValidator();
 app.use(express.json());
+app.disable("x-powered-by"); //Disable powered by header to prevent vulnerability scans against swordbattle.
 // Add properties to it
 schema
   .is()
@@ -89,16 +101,15 @@ const { config } = require("dotenv");
 
 
 const checkifMissingFields = (req,res,next) => {
-if(typeof req.body!=="object" || typeof req.body.password !== "string" || typeof req.body.username !== "string" || typeof req.body.captcha !== "string") {	
+if(typeof req.body!=="object" || typeof req.body.password !== "string" || typeof req.body.username !== "string" || typeof req.body.captcha !== "string") {
 		res.send({error: "Missing fields"});
 		return;
 }
 next();
 };
 
-const io = new Server(usinghttps ? httpsserver : server, {
-  cors: { origin: "*" },
-});
+const WsMapper = require("./classes/WsMapper");
+const io = new WsMapper(wss);
 
 const evolutions = require("./classes/evolutions");
 const { lineCircle } = require("intersects");
@@ -108,12 +119,13 @@ function getRandomInt(min, max) {
   return min + Math.floor(Math.random() * (max - min + 1));
 }
 
-var production = true;
+var production = process.env.PRODUCTION == "true";
 if (production) {
 	const rateLimit = require("express-rate-limit");
 	const limiter = rateLimit({
 		windowMs: 60 * 1000, // 1 min
-		max: 300, // limit each IP to 52 requests per min 
+		max: 700, // limit each IP to 700 requests per min
+		message: "Too many requests from this IP address, please try again later." //Add message when rate-limit
 	});
 	app.use(limiter);
 }
@@ -156,7 +168,6 @@ var oldlevels = [
   {coins: 100000, scale: 1.7},
   {coins: 200000, scale: 1.8},
 ];
-console.log(Object.keys(oldlevels).length);
 app.set("trust proxy", true);
 /*
 app.use((req, res, next) => {
@@ -177,7 +188,7 @@ app.all("*", (req, res, next) => {
     return;
   } else next();
 } catch (e) {
-  console.log(e);
+  // console.log(e);
   next();
 }
 
@@ -186,10 +197,10 @@ app.all("*", (req, res, next) => {
 var levels = [];
 oldlevels.forEach((level, index)  =>{
 	if(index == 0) {
-		levels.push(Object.assign({start: 0},level)); 
+		levels.push(Object.assign({start: 0, num:index+1},level));
 	}
 	else {
-		levels.push(Object.assign({start: levels[index - 1].coins}, level));
+		levels.push(Object.assign({start: levels[index - 1].coins, num:index+1}, level));
 	}
 });
 
@@ -220,6 +231,12 @@ app.use(function (req, res, next) {
 });
 
 app.use("/", express.static("dist"));
+app.use("/", express.static("public"));
+
+app.get("/", (req, res) => {
+  res.send("Please build the client first<br/>Run npm run build");
+});
+
 app.use("/assets", express.static("assets"));
 
 app.post("/api/buy", async (req, res) => {
@@ -321,12 +338,40 @@ app.post("/api/equip", async (req, res) => {
   }
 });
 
+app.post("/api/changepassword", async (req,res) => {
+  if(typeof req.body !== "object" || typeof req.body.secret !== "string" || typeof req.body.oldPass !== "string" || typeof req.body.newPass !== "string") {
+    res.status(400).send({error: "Missing fields"});
+		return;
+  }
+  var secret = req.body.secret;
+  if(!schema.validate(req.body.newPass)) {
+		res.send({error:schema.validate(req.body.newPass, { details: true })[0].message});
+		return;
+	}
+  var account = await sql`SELECT password, secret FROM accounts WHERE secret=${secret}`;
+  if(!account[0]) {
+    res.status(400).status(400).send({error: "Invalid secret"});
+    return;
+  };
+
+  oldPassHash = account[0].password;
+  match = await bcrypt.compare(req.body.oldPass, oldPassHash);
+  if (!match){
+    res.send({error: "Invalid password"});
+		return;
+  };
+
+  newSecret = uuid.v4()
+  newAccount = await sql`UPDATE accounts SET password=${bcrypt.hashSync(req.body.newPass, 10)}, secret=${newSecret} WHERE secret=${req.body.secret}`
+  res.send({"Success": true, "secret": newSecret})
+});
+
 app.post("/api/changename", async (req,res) => {
-	if(typeof req.body!=="object" || typeof req.body.secret !== "string" || typeof req.body.username !== "string") {	
+	if(typeof req.body!=="object" || typeof req.body.secret !== "string" || typeof req.body.username !== "string") {
 		res.status(400).send({error: "Missing fields"});
 		return;
 	}
-  
+
   //check if secret valid
   var secret = req.body.secret;
   var newUsername = req.body.username;
@@ -360,12 +405,22 @@ app.post("/api/changename", async (req,res) => {
 		res.status(400).send({error: "Username can only contain letters, numbers, spaces, and the following symbols: !@\"$%&:';()*\+,-=[\]\^_{|}<>~`"});
 		return;
 	}
-	
+
 	var containsProfanity = filter.check(newUsername);
 	if(containsProfanity) {
 		res.status(400).send({error: "Username contains a bad word!\nIf this is a mistake, please contact an admin."});
 		return;
 	}
+
+  try {
+  var containsProfanity2 = await filtery.containsProfanity(newUsername);
+  if(containsProfanity2) {
+    res.status(400).send({error: "Username contains a bad word!\nIf this is a mistake, please contact an admin."});
+    return;
+  }
+  } catch(e) {
+    console.log(e);
+  }
 
   //get days since lastchange
   var daysSince = await sql`select (now()::date - lastusernamechange::date) as days from accounts where secret=${secret}`;
@@ -375,7 +430,7 @@ app.post("/api/changename", async (req,res) => {
     res.status(400).send({error: `You can change your username again in ${7-daysSince[0].days} days`});
     return;
   }
-  
+
 
 
   //check if new username exists
@@ -391,12 +446,12 @@ app.post("/api/changename", async (req,res) => {
   await sql`UPDATE games SET name=${newUsername} WHERE lower(name)=${oldUsernameLower} AND verified=true`;
 
   res.status(200).send("Success");
-  
+
 });
 
 app.post("/api/signup",checkifMissingFields, async (req, res) => {
-  
-	if(typeof req.body!=="object" || typeof req.body.password !== "string" || typeof req.body.username !== "string") {	
+
+	if(typeof req.body!=="object" || typeof req.body.password !== "string" || typeof req.body.username !== "string") {
 		res.send({error: "Missing fields"});
 		return;
 	}
@@ -430,12 +485,23 @@ app.post("/api/signup",checkifMissingFields, async (req, res) => {
 		res.send({error: "Username can only contain letters, numbers, spaces, and the following symbols: !@\"$%&:';()*\+,-=[\]\^_{|}<>~`"});
 		return;
 	}
-	
+
 	var containsProfanity = filter.check(username);
 	if(containsProfanity) {
 		res.send({error: "Username contains a bad word!\nIf this is a mistake, please contact an admin."});
 		return;
 	}
+
+
+  try {
+  var containsProfanity2 = await filtery.containsProfanity(username);
+	if(containsProfanity2) {
+		res.send({error: "Username contains a bad word!\nIf this is a mistake, please contact an admin."});
+		return;
+	}
+} catch(e) {
+  console.log(e);
+}
 	var exists = await sql`select exists(select 1 from accounts where lower(username)=lower(${username}))`;
 
 	if (exists[0].exists) {
@@ -443,6 +509,7 @@ app.post("/api/signup",checkifMissingFields, async (req, res) => {
 		return;
 	}
 
+ async function doit() {
 	bcrypt.hash(req.body.password, 10, (err, hash) => {
 		if (err) {
 			res.status(500).send({error:"Internal server error"});
@@ -452,12 +519,39 @@ app.post("/api/signup",checkifMissingFields, async (req, res) => {
 		sql`insert into accounts(username, password, email, secret, skins, lastlogin) values(${username}, ${hash}, ${req.body.email}, ${secret}, ${JSON.stringify({collected: ["player"], selected: "player"})}, ${Date.now()})`;
 		res.send({secret: secret});
 	});
+ }
+
+ var send = {
+  secret: process.env.CAPTCHASECRET,
+  response: req.body.captcha,
+  remoteip: req.headers["x-forwarded-for"] || req.socket?.remoteAddress
+};
+
+if(recaptcha) {
+  axios
+    .post(
+      "https://www.google.com/recaptcha/api/siteverify?" +
+  new URLSearchParams(send)
+    )
+    .then(async (f) => {
+      f = f.data;
+      if (!f.success) {
+        res.status(403).send({error: "Captcha failed " +  f["error-codes"].toString()});
+        return;
+      }
+      if (f.score < 0.3) {
+        res.status(403).send({error: "Captcha score too low"});
+        return;
+      }
+      doit();
+    });
+}else doit();
 
 
 
 });
 
-app.post("/api/login",checkifMissingFields, async (req, res) => { 
+app.post("/api/login",checkifMissingFields, async (req, res) => {
 
 
 	async function doit() {
@@ -475,13 +569,13 @@ app.post("/api/login",checkifMissingFields, async (req, res) => {
 		res.send({error: "Invalid password"});
 		return;
 	}
-	
+
 	res.send(account[0]);
 	}
 	var send = {
 		secret: process.env.CAPTCHASECRET,
 		response: req.body.captcha,
-		remoteip: req.headers["x-forwarded-for"] || req.socket.remoteAddress 
+		remoteip: req.headers["x-forwarded-for"] || req.socket?.remoteAddress
 	};
 	if(recaptcha) {
 		axios
@@ -574,7 +668,7 @@ app.get("/shop", async (req, res) => {
           else counts[y] = 1;
         });
       });
-    
+
       acc.bal = yo[0].sum + acc.coins;
     }
   }
@@ -591,33 +685,45 @@ app.get("/leaderboard", async (req, res) => {
   //SELECT * from games where EXTRACT(EPOCH FROM (now() - created_at)) < 86400 ORDER BY coins DESC LIMIT 10
 
   //var lb= await sql`SELECT * FROM games ORDER BY coins DESC LIMIT 13`;
-  var type = ["coins", "kills", "time", "xp"].includes(req.query.type)
+  var type = ["coins", "kills", "time", "xp","totalkills","totaltime","totalcoins"].includes(req.query.type)
     ? req.query.type
-    : "coins";
+    : "xp";
   var duration = ["all", "day", "week", "xp"].includes(req.query.duration)
     ? req.query.duration
     : "all";
-  if (type !== "xp") {
+  if (type !== "xp" && !type.startsWith("total")) {
     if (duration != "all") {
       var lb =
         await sql`SELECT * from games where EXTRACT(EPOCH FROM (now() - created_at)) < ${
           duration == "day" ? "86400" : "608400"
-        } ORDER BY ${sql(type)} DESC, created_at DESC LIMIT 23`;
+        } ORDER BY ${sql(type)} DESC, created_at DESC LIMIT 103`;
     } else {
       var lb = await sql`SELECT * from games ORDER BY ${sql(
         type
-      )} DESC, created_at DESC LIMIT 23`;
+      )} DESC, created_at DESC LIMIT 103`;
     }
   } else {
     if (duration != "all") {
+      if(type == "xp"){
       var lb =
-        await sql`select name,(sum(coins)+(sum(kills)*100)) as xp from games where verified = true and EXTRACT(EPOCH FROM (now() - created_at)) < ${
+        await sql`select name,(sum(coins)+(sum(kills)*300)) as xp from games where verified = true and EXTRACT(EPOCH FROM (now() - created_at)) < ${
           duration == "day" ? "86400" : "608400"
-        } group by name order by xp desc limit 23`;
+        } group by name order by xp desc limit 103`;
+      }else{
+        var lb =
+        await sql`select name,sum(${sql(type.slice(5))}) as ${sql(type.slice(5))} from games where verified = true and EXTRACT(EPOCH FROM (now() - created_at)) < ${
+          duration == "day" ? "86400" : "608400"
+        } group by name order by ${sql(type.slice(5))} desc limit 103`;
+      }
     } else {
+      if (type == "xp") {
       var lb =
-        await sql`select name,(sum(coins)+(sum(kills)*100)) as xp from games where verified = true group by name order by xp desc limit 23`;
-    }
+        await sql`select name,(sum(coins)+(sum(kills)*300)) as xp from games where verified = true group by name order by xp desc limit 103`;
+      } else {
+        var lb =
+        await sql`select name,sum(${sql(type.slice(5))}) as ${sql(type.slice(5))} from games where verified = true group by name order by ${sql(type.slice(5))} desc limit 103`;
+      }
+      }
     lb = lb.map((x) => {
       x.verified = true;
       return x;
@@ -656,8 +762,8 @@ app.get("/:user", async (req, res, next) => {
 			WHERE DATE_ACTUAL>='2022-01-01'
 		order by date_actual asc
 		) A
-		
-		LEFT outer JOIN 
+
+		LEFT outer JOIN
 		(
 		SELECT
 		NAME,
@@ -671,27 +777,27 @@ app.get("/:user", async (req, res, next) => {
 		ON A.dt=B.PLAYED_DATE
 		WHERE NAME='Dooku'
 		ORDER BY A.dt ASC
-	
+
 */
 
     var stats = await sql`
-		select a.dt,b.name,b.xp,b.kills from
+		select a.dt,b.name,b.xp,b.kills,b.coins,b.time from
 		(
 		select distinct(created_at::date) as Dt from games where created_at >= ${
       dbuser[0].created_at
-    }::date-1 
-		order by created_at::date 
+    }::date-1
+		order by created_at::date
 		) a
 		left join
 		(
-		  SELECT name,created_at::date as dt1,(sum(coins)+(sum(kills)*100)) as xp,sum(kills) as kills ,sum(coins) as coins,
+		  SELECT name,created_at::date as dt1,(sum(coins)+(sum(kills)*300)) as xp,sum(kills) as kills ,sum(coins) as coins,
 		  sum(time) as time FROM games WHERE verified='true' and lower(name)=${user.toLowerCase()} group by name,created_at::date
 		) b on a.dt=b.dt1 order by a.dt asc
 		`;
     var lb =
-      await sql`select name,(sum(coins)+(sum(kills)*100)) as xp from games where verified = true group by name order by xp desc`;
+      await sql`select name,(sum(coins)+(sum(kills)*300)) as xp from games where verified = true group by name order by xp desc`;
     var lb2 =
-      await sql`select name,(sum(coins)+(sum(kills)*100)) as xp from games where verified = true and EXTRACT(EPOCH FROM (now() - created_at)) < 86400 group by name order by xp desc`;
+      await sql`select name,(sum(coins)+(sum(kills)*300)) as xp from games where verified = true and EXTRACT(EPOCH FROM (now() - created_at)) < 86400 group by name order by xp desc`;
     res.render("user.ejs", {
       user: dbuser[0],
       games: yo,
@@ -703,6 +809,7 @@ app.get("/:user", async (req, res, next) => {
   }
 });
 
+
 Object.filter = (obj, predicate) =>
   Object.keys(obj)
     .filter((key) => predicate(obj[key]))
@@ -713,16 +820,23 @@ var chests = [];
 var flyingSwords = [];
 
 var maxCoins = 2000;
-var maxChests = 20;
-var maxAiPlayers = 15;
-var maxPlayers = 50;
+
+var maxChests = 30;
+var maxUncommonChests = 15;
+var maxRareChests = 10;
+var maxEpicChests = 5;
+var maxLegendaryChests = 2;
+var maxMythicalChests = 1;
+
+var maxAiPlayers = 20;
+var maxPlayers = 100;
+
 
 io.on("connection", async (socket) => {
   socket.joinTime = Date.now();
-  socket.ip = socket.handshake.headers["x-forwarded-for"];
 
   if (moderation.bannedIps.includes(socket.ip)) {
-    socket.emit(
+    socket.send(
       "ban",
       "You are banned. Appeal to appeals@swordbattle.io<br><br>BANNED IP: " +
         socket.ip
@@ -730,7 +844,13 @@ io.on("connection", async (socket) => {
     socket.disconnect();
   }
 
-  socket.on("go", async (r, captchatoken, tryverify, options) => {
+  socket.on("pong", () => {
+    socket.lastSuccessfullPing = Date.now();
+    socket.ping = Date.now() - socket.lastPinged;
+    socket.pong = true;
+  });
+
+  socket.on("go", async ([r, captchatoken, tryverify, options]) => {
     async function ready() {
       var name;
       if (!tryverify) {
@@ -740,10 +860,15 @@ io.on("connection", async (socket) => {
         } catch (e) {
           name = r.substring(0, 16);
         }
+        try {
+          name = await filtery.clean(name);
+        } catch(e) {
+          name = name;
+        }
       } else {
         var accounts = await sql`select * from accounts where secret=${r}`;
         if (!accounts[0]) {
-          socket.emit(
+          socket.send(
             "ban",
             "Invalid secret, please try logging out and relogging in"
           );
@@ -751,6 +876,11 @@ io.on("connection", async (socket) => {
           return;
         }
         var name = accounts[0].username;
+        if(Object.values(PlayerList.players).find((p)=>p.verified&&p.name.toLowerCase()==name.toLowerCase())) {
+          socket.send("ban","<br/><h1>You are already playing on another device</h1>");
+          socket.disconnect();
+          return;
+        }
       }
 
       var thePlayer = new Player(socket.id, name);
@@ -765,43 +895,42 @@ io.on("connection", async (socket) => {
 					thePlayer.skin = accounts[0].skins.selected;
 
           var lb =
-          await sql`select name,(sum(coins)+(sum(kills)*100)) as xp from games where verified = true group by name order by xp desc`;
+          await sql`select name,(sum(coins)+(sum(kills)*300)) as xp from games where verified = true group by name order by xp desc`;
           var rt = lb.findIndex((x) => x.name == name) + 1;
           if(rt <= 100) {
             thePlayer.ranking = rt;
           }
 				}
 
-				
+
 				PlayerList.setPlayer(socket.id, thePlayer);
 				console.log("player joined -> " + socket.id);
-				socket.broadcast.emit("new", thePlayer);
+				socket.broadcast.send("new", thePlayer.getSendObj());
 
 				var allPlayers = Object.values(PlayerList.players);
 				allPlayers = allPlayers.filter((player) => player.id != socket.id);
 
-				if (allPlayers && allPlayers.length > 0) socket.emit("players", allPlayers);
-				//TODO: Make coins emit only within range
-				socket.emit("coins", coins.filter((coin) => coin.inRange(thePlayer)));
-				socket.emit("chests", chests);
+				if (allPlayers && allPlayers.length > 0) socket.send("players", allPlayers);
+				socket.send("coins", coins.filter((coin) => coin.inRange(thePlayer)));
+				socket.send("chests", chests);
 
 				socket.joined = true;
-        socket.emit("levels", levels);
+        socket.send("levels", levels);
 
 		}
 		if (!captchatoken && recaptcha) {
-			socket.emit(
+			socket.send(
 				"ban",
 				"You were kicked for not sending a captchatoken. Send this message to bugs@swordbattle.io if you think this is a bug."
 			);
 			return socket.disconnect();
 		}
 		if (!r) {
-			socket.emit("ban", "You were kicked for not sending a name. ");
+			socket.send("ban", "You were kicked for not sending a name. ");
 			return socket.disconnect();
 		}
 		if (PlayerList.has(socket.id)) {
-			socket.emit(
+			socket.send(
 				"ban",
 				"You were kicked for 2 players on 1 id. Send this message to support@swordbattle.io<br> In the meantime, try restarting your computer if this happens a lot. "
 			);
@@ -809,7 +938,7 @@ io.on("connection", async (socket) => {
 		}
 		//console.log(Object.values(PlayerList.players).length);
 		if (Object.values(PlayerList.players).length >= maxPlayers) {
-			socket.emit("ban", "Server is full. Please try again later.");
+			socket.send("ban", "Server is full. Please try again later.");
 			return socket.disconnect();
 		}
 
@@ -827,7 +956,7 @@ io.on("connection", async (socket) => {
 				.then((f) => {
 					f = f.data;
 					if (!f.success) {
-						socket.emit(
+						socket.send(
 							"ban",
 							"Error while verifying captcha<br>" + f["error-codes"].toString()
 						);
@@ -835,7 +964,7 @@ io.on("connection", async (socket) => {
 						return;
 					}
 					if (f.score < 0.3) {
-						socket.emit(
+						socket.send(
 							"ban",
 							`Captcha score too low: ${f.score}<br><br>If you're using a vpn, disable it. <br>If your on incognito, go onto a normal window<br>If your not signed in to a google account, sign in<br><br>If none of these worked, contact support@swordbattle.io`
 						);
@@ -848,29 +977,33 @@ io.on("connection", async (socket) => {
 	});
 
   socket.on("evolve", (eclass) => {
-    if(!PlayerList.has(socket.id)) return socket.emit("refresh");
+    if(!PlayerList.has(socket.id)) return socket.send("refresh");
     var player = PlayerList.getPlayer(socket.id);
     if(player && player.evolutionQueue && player.evolutionQueue.length > 0 && player.evolutionQueue[0].includes(eclass.toLowerCase())) {
       eclass = eclass.toLowerCase();
       player.evolutionQueue.shift();
       var evo = evolutions[eclass];
       console.log(player.name + " evolved to " + eclass);
-          
+
+
+
         player.evolutionData = {default: evo.default(), ability: evo.ability()};
       player.evolution =evo.name;
+      player.checkSubEvolutions();
       player.updateValues();
+
       return;
     }
   });
   socket.on("ability", () => {
-    if(!PlayerList.has(socket.id)) return socket.emit("refresh");
+    if(!PlayerList.has(socket.id)) return socket.send("refresh");
     var player = PlayerList.getPlayer(socket.id);
     if(player.evolution != "") {
       // check if ability activated already
       if(player.ability <= Date.now()) {
         player.ability = evolutions[player.evolution].abilityCooldown + evolutions[player.evolution].abilityDuration + Date.now();
         console.log(player.name + " activated ability");
-        socket.emit("ability", [evolutions[player.evolution].abilityCooldown , evolutions[player.evolution].abilityDuration, Date.now()]);
+        socket.send("ability", [evolutions[player.evolution].abilityCooldown , evolutions[player.evolution].abilityDuration, Date.now()]);
       }
     }
   });
@@ -880,9 +1013,9 @@ io.on("connection", async (socket) => {
 			var thePlayer = PlayerList.getPlayer(socket.id);
 			thePlayer.mousePos = mousePos;
 			PlayerList.updatePlayer(thePlayer);
-     
+
 		}
-		else socket.emit("refresh");
+		else socket.send("refresh");
 
 		//console.log(mousePos.x +" , "+mousePos.y )
 	});
@@ -896,7 +1029,7 @@ io.on("connection", async (socket) => {
       flyingSwords.push({hit: [], scale: player.scale, x: player.pos.x, y: player.pos.y, time: Date.now(), angle: player.calcSwordAngle(), skin: player.skin, id: socket.id});
       player.lastSwordThrow = Date.now();
       PlayerList.updatePlayer(player);
-    } else socket.emit("refresh");
+    } else socket.send("refresh");
   });
 
 	socket.on("mouseDown", (down) => {
@@ -905,7 +1038,7 @@ io.on("connection", async (socket) => {
 			if (player.mouseDown == down || !player.swordInHand) return;
 			[coins,chests] = player.down(down, coins, io, chests);
 			PlayerList.updatePlayer(player);
-		} else socket.emit("refresh");
+		} else socket.send("refresh");
 	});
 
 	socket.on("move", (controller) => {
@@ -923,7 +1056,7 @@ io.on("connection", async (socket) => {
 	socket.on( "ping", function ( fn ) {
 		fn(); // Simply execute the callback on the client
 	} );
-	socket.on("chat", (msg) => {
+	socket.on("chat", async (msg) => {
 		msg = msg.trim().replace(/\\/g, "\\\\");
 		if (msg.length > 0) {
 			if (msg.length > 35) msg = msg.substring(0, 35);
@@ -931,12 +1064,19 @@ io.on("connection", async (socket) => {
 			var p = PlayerList.getPlayer(socket.id);
 			p.lastChat = Date.now();
 			PlayerList.setPlayer(socket.id, p);
-			
-				io.sockets.emit("chat", {
+      try {
+			msg = await filtery.clean(msg);
+				io.sockets.send("chat", {
 					msg: filter.clean(msg),
 					id: socket.id,
 				});
-			}
+			} catch(e) {
+        io.sockets.send("chat", {
+					msg: filter.clean(msg),
+					id: socket.id,
+				});
+      }
+    }
 		});
 	function clamp(num, min, max) {
 		return num <= min ? min : num >= max ? max : num;
@@ -945,10 +1085,10 @@ io.on("connection", async (socket) => {
 		if(serverState == "exiting") return;
 		if (!PlayerList.has(socket.id)) return;
 		var thePlayer = PlayerList.getPlayer(socket.id);
-
+console.log(thePlayer.name + " - " + socket.id + " disconnected");
               //drop their coins
               var drop = [];
-              var dropAmount = clamp(Math.round(thePlayer.coins*0.8), 10, 20000);
+              var dropAmount = thePlayer.coins < 13 ? 10 : Math.round(thePlayer.coins < 25000 ? thePlayer.coins * 0.8 : Math.log10(thePlayer.coins) * 30000 - 111938.2002602);
               var dropped = 0;
               while (dropped < dropAmount) {
                 var r = thePlayer.radius * thePlayer.scale * Math.sqrt(Math.random());
@@ -968,14 +1108,14 @@ io.on("connection", async (socket) => {
                 drop.push(coins[coins.length - 1]);
               }
 
-                io.sockets.emit("coin", drop, [thePlayer.pos.x, thePlayer.pos.y]);
-								
-              
+                io.sockets.send("coin", [drop, [thePlayer.pos.x, thePlayer.pos.y]]);
+
+
 
 		sql`INSERT INTO games (name, coins, kills, time, verified) VALUES (${thePlayer.name}, ${thePlayer.coins}, ${thePlayer.kills}, ${Date.now() - thePlayer.joinTime}, ${thePlayer.verified})`;
 
 		PlayerList.deletePlayer(socket.id);
-		socket.broadcast.emit("playerLeave", socket.id);
+		socket.broadcast.send("playerLeave", socket.id);
 	});
 });
 
@@ -998,6 +1138,8 @@ app.get("/api/serverinfo", (req, res) => {
   });
 });
 
+var lastSendAll = 0;
+var allSendInt = 500;
 setInterval(async () => {
 	//const used = process.memoryUsage().heapUsed / 1024 / 1024;
 //console.log(`The script uses approximately ${Math.round(used * 100) / 100} MB`);
@@ -1005,11 +1147,31 @@ setInterval(async () => {
 	moderation.io = io;
 	if (coins.length < maxCoins) {
 		coins.push(new Coin());
-		io.sockets.emit("coin", coins[coins.length - 1]);
+		io.sockets.send("coin", [coins[coins.length - 1]]);
 	}
-	if(chests.length < maxChests) {
+	if(chests.filter(c=>c.rarity == "normal").length < maxChests) {
 		chests.push(new Chest());
-		io.sockets.emit("chest", chests[chests.length - 1]);
+		io.sockets.send("chest", chests[chests.length - 1]);
+	}
+  if(chests.filter(c=>c.rarity == "uncommon").length < maxUncommonChests) {
+		chests.push(new Chest(undefined, "uncommon"));
+		io.sockets.send("chest", chests[chests.length - 1]);
+	}
+  if(chests.filter(c=>c.rarity == "rare").length < maxRareChests) {
+		chests.push(new Chest(undefined, "rare"));
+		io.sockets.send("chest", chests[chests.length - 1]);
+	}
+  if(chests.filter(c=>c.rarity == "epic").length < maxEpicChests) {
+		chests.push(new Chest(undefined, "epic"));
+		io.sockets.send("chest", chests[chests.length - 1]);
+	}
+  if(chests.filter(c=>c.rarity == "legendary").length < maxLegendaryChests && Math.random() < 0.1) {
+		chests.push(new Chest(undefined, "legendary"));
+		io.sockets.send("chest", chests[chests.length - 1]);
+	}
+  if(chests.filter(c=>c.rarity == "mythical").length < maxMythicalChests && Math.random() < 0.01) {
+		chests.push(new Chest(undefined, "mythical"));
+		io.sockets.send("chest", chests[chests.length - 1]);
 	}
 	var normalPlayers = Object.values(PlayerList.players).filter(p => p && !p.ai).length;
 	var aiPlayers = Object.keys(PlayerList.players).length;
@@ -1029,7 +1191,7 @@ setInterval(async () => {
     var a = degrees_to_radians(sword.angle-45);
     sword.x += Math.cos(a) * 100;
     sword.y += Math.sin(a) * 100;
-    
+
     //collision check
       //HARDCODED
     var tip = movePointAtAngle([sword.x, sword.y], a, (130*sword.scale));
@@ -1040,7 +1202,7 @@ setInterval(async () => {
       if(sword.hit.includes(player.id)) return;
       var swordOwner = PlayerList.getPlayer(sword.id);
       if(!swordOwner) return hit=true;
-    
+
 
       // check line collision
       if(lineCircle(tip[0], tip[1], base[0], base[1], player.pos.x, player.pos.y, player.radius*player.scale)) {
@@ -1053,14 +1215,18 @@ setInterval(async () => {
     // chest collisions
     chests.forEach((chest, i) => {
       if(lineBox(tip[0], tip[1], base[0], base[1], chest.pos.x, chest.pos.y, chest.width, chest.height)) {
+        chest.health -= 1;
+        io.sockets.send("chestHealth", [chest.id, chest.health, sword.id]);
+        if(chest.health <= 0) {
         chests.splice(chests.indexOf(chest), 1);
-        io.sockets.emit("collected", chest.id, sword.id, false);
+        io.sockets.send("collected", [chest.id, sword.id, false]);
 
         //drop coins at that spot
         var drop = chest.open();
 
-        io.sockets.emit("coin", drop, [chest.pos.x+(chest.width/2), chest.pos.y+(chest.height/2)]);
+        io.sockets.send("coin", [drop, [chest.pos.x+(chest.width/2), chest.pos.y+(chest.height/2)]]);
           coins.push(...drop);
+        }
       }
     });
     if (Date.now() - sword.time > 1000) {
@@ -1069,28 +1235,27 @@ setInterval(async () => {
       if(player) {
         player.swordInHand = true;
         PlayerList.updatePlayer(player);
-      } 
+      }
     }
   });
-  io.emit("flyingSwords", flyingSwords);
+  io.sockets.send("flyingSwords", flyingSwords);
 
 	if (normalPlayers > 0 && aiPlayers < maxAiPlayers && getRandomInt(0,100) == 5) {
 		var id = uuidv4();
 		var theAi = new AiPlayer(id);
-		console.log("AI Player Joined -> "+theAi.name);
 		PlayerList.setPlayer(id, theAi);
-		io.sockets.emit("new", theAi);
+		io.sockets.send("new", theAi.getSendObj());
 	}
-	//emit tps to clients
+	//send tps to clients
 	if (Date.now() - secondStart >= 1000) {
-		io.sockets.emit("tps", tps);
+		io.sockets.send("tps", tps);
 		actps = tps;
 		//console.log("Players: "+Object.keys(players).length+"\nTPS: "+tps+"\n")
 		secondStart = Date.now();
 		tps = 0;
 	}
 	if (Date.now() - lastChestSend >= 10000) {
-		io.sockets.emit("chests", chests);
+		io.sockets.send("chests", chests);
 
 		lastChestSend = Date.now();
 	}
@@ -1101,18 +1266,52 @@ setInterval(async () => {
 
 	sockets.forEach((b) => {
 		if (!b.joined && Date.now() - b.joinTime > 10000) {
-			b.emit(
+			b.send(
 				"ban",
 				"You have been kicked for not sending JOIN packet. <br>This is likely due to slow wifi.<br>If this keeps happening, try restarting your device."
 			);
 			b.disconnect();
 		}
+
+    if(!b.lastPinged) {
+      b.lastPinged = 0;
+      b.ping = 0;
+      b.lastSuccessfullPing = 0;
+      b.pong = true;
+    }
+    if((Date.now() - b.lastPinged > 2000) && b.pong) {
+      b.pong = false;
+      b.send("ping", b.ping);
+      b.lastPinged = Date.now();
+    } else if (Date.now() - b.lastPinged >30000) {
+      b.send("ban", "You have been kicked for not responding to ping packets. <br>This is likely due to slow wifi.<br>If this keeps happening, try restarting your device.");
+      // emit disconnect to players
+      b.broadcast.send("playerDied", [b.id]);
+      b.disconnect();
+
+
+    }
 	});
 
+  const shouldSendAll = Date.now() - lastSendAll >= allSendInt;
+  if(shouldSendAll) {
+    var allArr = [];
+  }
 	playersarray.forEach((player) => {
-    
+
 		if(player) {
       player.updateValues();
+      if(shouldSendAll) {
+        allArr.push({
+          id: player.id,
+          name: player.name,
+          pos: player.pos,
+          scale: player.scale,
+          coins: player.coins,
+          ranking: player.ranking,
+          verified: player.verified,
+        });
+      }
 			//   player.moveWithMouse(players)
 			if(player.ai) {
 				[coins,chests] = player.tick(coins, io, levels, chests);
@@ -1128,27 +1327,35 @@ setInterval(async () => {
 			}
 			PlayerList.updatePlayer(player);
 
-			//emit player data to all clients
+			//send player data to all clients
 			sockets.forEach((socket) => {
-				if(!player.getSendObj()) console.log("gg");
-				if (player.id != socket.id) socket.emit("player", player.getSendObj());
-				else {
-					socket.emit("me", player);
+        var outOfRange = [];
+				if(!player.getSendObj()) console.log("couldnt get send obj");
+				if ((player.id != socket.id) && (PlayerList.getPlayer(socket.id) ? player.inRange(PlayerList.getPlayer(socket.id)) : true)) socket.send("player", player.getSendObj());
+				else if(player.id == socket.id) {
+					socket.send("me", player);
 				if(Date.now() - lastCoinSend >= 1000) {
-					socket.emit("coins", coins.filter((coin) => coin.inRange(player)));
+					socket.send("coins", coins.filter((coin) => coin.inRange(player)));
 				}
-				}
+				 	} else {
+          outOfRange.push(player.id);
+        }
+        if(outOfRange.length > 0) socket.send("outOfRange", outOfRange);
 			});
 		}
 	});
 	if(Date.now() - lastCoinSend >= 1000) {
 		lastCoinSend = Date.now();
 	}
+  if(shouldSendAll) {
+    io.sockets.send("all", allArr);
+    lastSendAll = Date.now();
+  }
 	tps += 1;
 }, 1000 / 30);
 
 server.listen(process.env.PORT || 3000, () => {
-  console.log("server started");
+  console.log("server started on port: ", process.env.PORT || 3000);
 });
 
 process.on("SIGTERM", () => {
@@ -1175,7 +1382,7 @@ process.on("SIGTERM", () => {
           process.exit(1);
         });
       } else process.exit(1);
-     
+
     });
 });
 process.on("SIGINT", () => {
@@ -1269,7 +1476,7 @@ async function cleanExit() {
     if (player && !player.ai) {
       var socket = sockets.find((s) => s.id == player.id);
       if (socket) {
-        socket.emit(
+        socket.send(
           "ban",
           "<h1>Server is shutting down, we'll be right back!<br>Sorry for the inconvenience.<br><br>" +
             (player.verified

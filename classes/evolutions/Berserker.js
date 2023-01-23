@@ -1,11 +1,17 @@
+
+
 const Evolution = require("./Evolution");
+
+const Knight = require("./Knight");
+const Vampire = require("./Vampire");
+
 class Berserker extends Evolution {
     constructor() {
         super();
         this.name = "berserker";
         this.abilityDuration = 10000;
         this.abilityCooldown = 60000;
-        this.subEvolutions = [];
+        this.subEvolutions = [20000, new Knight(), new Vampire()];
     }
     default() {
         return {
@@ -18,10 +24,10 @@ class Berserker extends Evolution {
     }
     ability() {
         return {
-            speed: 1.8,
+            speed: 1.5,
             power: 2,
             resistance: 1.2,
-            damage: 2,
+            damage: 1.5,
             damageCooldown: 0.5,
         };
     }
